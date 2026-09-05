@@ -37,7 +37,7 @@ def test_an_entry_with_no_model_is_skipped_not_adopted():
         seen.append(entry.get("provider"))
         return _runtime(entry["provider"])
 
-    runtime, model = resolve_non_cooling_fallback_runtime(
+    runtime, model, _entry = resolve_non_cooling_fallback_runtime(
         chain, is_rate_limited=lambda _rt: False, resolve_entry=_resolve
     )
 
@@ -55,7 +55,7 @@ def test_a_cooling_fallback_is_passed_over_for_a_healthy_one_further_down():
         {"provider": "openrouter", "model": "z-ai/glm-5.2"},
     ]
 
-    runtime, model = resolve_non_cooling_fallback_runtime(
+    runtime, model, _entry = resolve_non_cooling_fallback_runtime(
         chain,
         is_rate_limited=lambda rt: rt["provider"] == "zai",
         resolve_entry=lambda e: _runtime(e["provider"]),
@@ -69,7 +69,7 @@ def test_every_fallback_cooling_still_beats_the_benched_primary():
     """A different quota bucket has a chance the primary provably does not."""
     chain = [{"provider": "zai", "model": "glm-5.2"}]
 
-    runtime, model = resolve_non_cooling_fallback_runtime(
+    runtime, model, _entry = resolve_non_cooling_fallback_runtime(
         chain,
         is_rate_limited=lambda _rt: True,
         resolve_entry=lambda e: _runtime(e["provider"]),

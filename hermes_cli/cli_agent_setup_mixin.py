@@ -5,6 +5,7 @@ imported lazily inside each method (import cycle)."""
 from __future__ import annotations
 
 import sys
+import time
 
 from rich.markup import escape as _escape
 
@@ -175,8 +176,46 @@ class CLIAgentSetupMixin:
     def _ensure_runtime_credentials(self) -> bool:
         """Re-resolve provider credentials before agent use so key rotation / token
         refresh are picked up without restarting the CLI. False on auth failure."""
-        from cli import ChatConsole, logger
+        from cli import ChatConsole, _cprint, logger
         from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+        from hermes_cli.provider_cooldown import cooldown_label, demote_if_rate_limited
+
+        # ── Return from a rate-limit demotion ──
+        # Restoring HERE, before resolution, is what makes the return free: the
+        # primary is never re-probed while it is still benched, so the session
+        # neither spends a doomed request nor strands itself on the fallback
+        # until the user restarts. The switch therefore lands BETWEEN turns --
+        # an answer being streamed when the window elapses finishes on the
+        # model that started it.
+        _demotion = getattr(self, "_cooldown_demotion", None)
+        if _demotion:
+            # Is this session still where the demotion put it? Asked every
+            # turn, not only once the window elapses: if the user ran `/model`
+            # they chose with the fallback in view, and a snapshot taken before
+            # that choice must stop being able to revert it -- including later,
+            # via a second demotion that would otherwise inherit it.
+            _still_ours = (
+                self.requested_provider == _demotion.get("switched_to_provider")
+                and self.model == _demotion.get("switched_to_model")
+            )
+            if not _still_ours:
+                self._cooldown_demotion = None
+                logger.info(
+                    "Session was switched to %s/%s while %s cooled down — "
+                    "dropping the pending return and leaving the choice alone",
+                    self.requested_provider or "?", self.model,
+                    _demotion.get("requested_provider") or "?",
+                )
+            elif time.time() >= (_demotion.get("until") or 0):
+                self._cooldown_demotion = None
+                self.requested_provider = _demotion.get("requested_provider")
+                self.model = _demotion.get("model")
+                self._explicit_api_key = _demotion.get("explicit_api_key")
+                self._explicit_base_url = _demotion.get("explicit_base_url")
+                _cprint(
+                    f"↩  Rate limit lifted — back on "
+                    f"{self.requested_provider or 'the primary provider'} / {self.model}"
+                )
         _primary_exc = None
         runtime = None
         try:
@@ -193,6 +232,59 @@ class CLIAgentSetupMixin:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
+
+        # ── Demote a provider whose whole credential pool is serving a 429 ──
+        # Resolution succeeds -- it hands back a key -- but every live
+        # credential is benched, so the request would 429 and only THEN reach
+        # the agent's own fallback. For a `hermes chat -q` worker (how a kanban
+        # card is dispatched) that is one doomed call per card.
+        _demoted_this_turn = False
+        _demoted_from = runtime.get("provider")
+        _chain = self._fallback_model if isinstance(self._fallback_model, list) else []
+        _demotion = demote_if_rate_limited(runtime, lambda: _chain)
+        runtime = _demotion.runtime
+        if _demotion.switched:
+            # Only a long-lived session owes a return, so the snapshot is this
+            # caller's own half. Taken ONCE: a later demotion of the fallback
+            # must not overwrite the primary we owe a return to, nor the window
+            # that decides when to take it.
+            _snapshot = getattr(self, "_cooldown_demotion", None) or {
+                "requested_provider": self.requested_provider,
+                "model": self.model,
+                "explicit_api_key": self._explicit_api_key,
+                "explicit_base_url": self._explicit_base_url,
+                "until": _demotion.cooling_until,
+            }
+            _cprint(
+                f"⚠️  {_demoted_from or 'Primary provider'} is rate-limited until "
+                f"{cooldown_label(_demotion.cooling_until)} — switching to "
+                f"{runtime.get('provider') or '?'} / {_demotion.model}"
+            )
+            self.requested_provider = runtime.get("requested_provider") or (
+                runtime.get("provider") or self.requested_provider
+            )
+            self.model = _demotion.model
+            self._cooldown_demotion = _snapshot
+            # Where we put the session is stamped further down, AFTER
+            # _normalize_model_for_provider has had its say: it rewrites
+            # self.model for most providers ("anthropic/claude-sonnet-4.6" ->
+            # "claude-sonnet-4-6"), and stamping the pre-normalization name
+            # here would make every later turn read as "the user moved on",
+            # dropping the return and stranding the session on the fallback
+            # until restart -- the exact failure the block above prevents.
+            _demoted_this_turn = True
+            # Re-point the explicit pins at the FALLBACK's own endpoint. A
+            # `--api-key`/`--base-url` pin names the PRIMARY's endpoint, and
+            # carrying it forward would resolve the fallback's provider while
+            # still holding the primary's bearer token -- a credential crossing
+            # an origin boundary. Merely clearing them is not enough either: an
+            # entry defined by an inline `base_url` cannot be re-resolved from
+            # its provider name alone. The snapshot above owns the primary's
+            # pins until the return.
+            self._explicit_base_url, self._explicit_api_key = (
+                _demotion.explicit_pins()
+            )
+
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
@@ -255,6 +347,14 @@ class CLIAgentSetupMixin:
         # Normalize model for the resolved provider (e.g. swap non-Codex models on openai-codex).
         # Fixes #651.
         model_changed = self._normalize_model_for_provider(resolved_provider)
+
+        # Only on the turn that demoted: a later user switch must NOT be
+        # recorded as ours, or the return would revert their choice.
+        if _demoted_this_turn:
+            _pending = getattr(self, "_cooldown_demotion", None)
+            if _pending is not None:
+                _pending["switched_to_provider"] = self.requested_provider
+                _pending["switched_to_model"] = self.model
 
         # AIAgent/OpenAI client holds auth at init, so rebuild on key/routing/model change.
         if (credentials_changed or routing_changed or model_changed) and self.agent is not None:

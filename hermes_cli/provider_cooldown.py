@@ -118,7 +118,7 @@ def resolve_non_cooling_fallback_runtime(
     resolve_entry: Optional[
         Callable[[dict[str, Any]], Optional[dict[str, Any]]]
     ] = None,
-) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[dict[str, Any]]]:
     """First entry in *chain* that resolves and is not itself rate-limited.
 
     Used when the primary's pooled credentials are all benched by a 429.
@@ -164,23 +164,23 @@ def resolve_non_cooling_fallback_runtime(
                 "the chain", entry.get("provider") or "?",
             )
             if cooling_but_resolvable is None:
-                cooling_but_resolvable = (runtime, model)
+                cooling_but_resolvable = (runtime, model, entry)
             continue
         logger.info(
             "Fallback provider resolved: %s model=%s",
             entry.get("provider") or runtime.get("provider"), model,
         )
-        return runtime, model or None
+        return runtime, model or None, entry
 
     # Everything left is cooling too. A benched fallback still beats a benched
     # primary that has no chance of a different quota bucket.
     if cooling_but_resolvable is not None:
-        runtime, model = cooling_but_resolvable
+        runtime, model, entry = cooling_but_resolvable
         logger.warning(
             "Every fallback is rate-limited too — using the first one anyway"
         )
-        return runtime, model or None
-    return None, None
+        return runtime, model or None, entry
+    return None, None, None
 
 
 def cooldown_label(until: float) -> str:
@@ -207,6 +207,29 @@ class Demotion:
     #: would rest on the walk refusing model-less entries elsewhere, which is
     #: not an invariant this object owns.
     switched: bool = False
+    #: The chain entry that took over, when one did. Only a caller that
+    #: outlives the turn needs it -- see :meth:`explicit_pins`.
+    entry: Optional[dict[str, Any]] = None
+    #: When the primary's pool re-enters rotation, so a long-lived caller can
+    #: decide when to go back. ``None`` when nothing was benched.
+    cooling_until: Optional[float] = None
+
+    def explicit_pins(self) -> tuple[Optional[str], Optional[str]]:
+        """``(base_url, api_key)`` a caller must pin to re-reach this route.
+
+        A caller that resolves again on a later turn cannot get back to a chain
+        entry defined by an inline ``base_url`` from its provider name alone.
+        Reading that off the entry is this object's job, not the caller's: the
+        entry is chain-config shape, and only this module should have to know
+        it.
+        """
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        entry = self.entry or {}
+        return (
+            entry.get("base_url") or None,
+            resolve_entry_api_key(entry) or None,
+        )
 
 
 def _draws_on_the_same_pool(
@@ -304,7 +327,7 @@ def demote_if_rate_limited(
         # primary should.
         logger.debug("Could not read the fallback chain", exc_info=True)
         entries = None
-    fb_runtime, fb_model = resolve_non_cooling_fallback_runtime(
+    fb_runtime, fb_model, fb_entry = resolve_non_cooling_fallback_runtime(
         entries, is_rate_limited=is_rate_limited, resolve_entry=resolve_entry
     )
     if fb_runtime is not None and _draws_on_the_same_pool(runtime, fb_runtime):
@@ -316,7 +339,7 @@ def demote_if_rate_limited(
             "The only usable fallback draws on %s's own pool — staying put",
             runtime.get("provider") or "?",
         )
-        fb_runtime, fb_model = None, None
+        fb_runtime, fb_model, fb_entry = None, None, None
     if fb_runtime is None:
         logger.warning(
             "%s: no usable fallback while %s cools down — spending the "
@@ -334,4 +357,7 @@ def demote_if_rate_limited(
         fb_runtime.get("provider") or "?",
         fb_model,
     )
-    return Demotion(fb_runtime, fb_model, switched=True)
+    return Demotion(
+        fb_runtime, fb_model, switched=True, entry=fb_entry,
+        cooling_until=cooling_until,
+    )
